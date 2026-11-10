@@ -1,0 +1,11 @@
+{
+  "uuid": "mbp115-3fg@alexg-78",
+  "name": "Three-Finger Drag",
+  "description": "Move windows and select text by dragging with three fingers, like on macOS. GNOME would turn three-finger swipes into workspace and overview gestures; this extension holds them back so libinput's three-finger drag can work. Those gestures use four fingers instead. Needs libinput 1.28 or newer with three-finger drag turned on.",
+  "shell-version": [
+    "50",
+    "51"
+  ],
+  "version": 2,
+  "url": "https://github.com/AlexG-78/maclike-trackpad"
+}

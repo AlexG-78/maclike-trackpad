@@ -1,0 +1,103 @@
+#!/bin/bash
+# mbp115-touchpad - bring the MacBookPro11,5 trackpad closer to macOS (run as a regular user).
+#   mbp115-touchpad [status]
+#   mbp115-touchpad pointer mac|mac-slow|mac-fast|default [factor]   acceleration curve (GNOME >= 51)
+#   mbp115-touchpad scroll <factor>        touchpad scrolling, e.g. 0.2 slower, 0.5 faster (immediate; kit default 0.3)
+#   mbp115-touchpad scroll-accel on|off    macOS-like scroll acceleration: slow = precise, fast = farther
+#   mbp115-touchpad drag on|off            3-finger drag (workspaces then use 4 fingers)
+# Pointer: macOS accelerates smoothly - very precise when slow, covers distance when fast. The "mac" curve mimics this:
+#   gain from 6.5 px/mm for slow to 48 px/mm for fast movements (half-point at 200 mm/s).
+#   Units: libinput works in device units for touchpads; the Apple USB trackpad has 97.8 per mm
+#   (bcm5974 Wellspring9: 10173 units over 104 mm according to the libinput quirk).
+set -uo pipefail
+TP=org.gnome.desktop.peripherals.touchpad
+CONF=$HOME/.config/mbp115/input.conf
+EXT=mbp115-3fg@alexg-78
+[ "$(id -u)" -ne 0 ] || { echo "Run as a regular user (without sudo)"; exit 1; }
+
+conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -1; }
+conf_set() {                              # write atomically, the library re-reads the file continuously
+    mkdir -p "${CONF%/*}"; local tmp; tmp=$(mktemp "${CONF}.XXXX")
+    { grep -v "^$1=" "$CONF" 2>/dev/null; echo "$1=$2"; } > "$tmp" && mv "$tmp" "$CONF"
+}
+custom_ok() { gsettings range "$TP" accel-profile 2>/dev/null | grep -q custom; }
+curve() {                                 # $1: factor -> GVariant for custom-accel-config
+    python3 -I - "$1" <<'PY'
+import sys
+k = float(sys.argv[1]); upm = 97.8; gmin, gmax, c = 6.5 * k, 48.0 * k, 200.0
+pts = []
+for i in range(64):                       # step 1 unit/ms ~ 10 mm/s, up to ~640 mm/s
+    v = i * 1000.0 / upm                  # finger speed in mm/s
+    g = gmin + (gmax - gmin) * v * v / (v * v + c * c)
+    pts.append(v * g / 1000.0)            # pointer speed in px/ms
+print("{'pointer-step': <1.0>, 'pointer-speeds': <[%s]>}" % ", ".join("%.4f" % p for p in pts))
+PY
+}
+# "Zustand:" matches the German-locale output of gnome-extensions info
+ext_state() { gnome-extensions info "$EXT" 2>/dev/null | sed -n 's/^ *State: //p;s/^ *Zustand: //p' | head -1; }
+ext_enable() {                            # $1: enable|disable; also works if GNOME does not know the extension yet
+    gnome-extensions "$1" "$EXT" 2>/dev/null && return 0
+    local cur; cur=$(gsettings get org.gnome.shell enabled-extensions)
+    if [ "$1" = enable ]; then
+        case $cur in *"'$EXT'"*) ;; "@as []"|"[]") gsettings set org.gnome.shell enabled-extensions "['$EXT']" ;;
+            *) gsettings set org.gnome.shell enabled-extensions "${cur%]}, '$EXT']" ;; esac
+    else
+        gsettings set org.gnome.shell enabled-extensions "$(echo "$cur" | sed "s/, '$EXT'//;s/'$EXT', //;s/'$EXT'//")"
+    fi
+}
+
+status() {
+    local pid; pid=$(pgrep -xu "$USER" gnome-shell | head -1)
+    printf 'GNOME             : %s\n' "$(gnome-shell --version 2>/dev/null)"
+    printf 'Pointer profile   : %s%s\n' "$(gsettings get $TP accel-profile)" "$(custom_ok || echo ' (custom curve requires GNOME 51+)')"
+    printf 'Natural scrolling / tap-to-click: %s / %s\n' "$(gsettings get $TP natural-scroll)" "$(gsettings get $TP tap-to-click)"
+    printf 'Scroll factor     : %s (acceleration %s)\n' "$(conf_get scroll || true)" "$( [ "$(conf_get scroll_accel)" = 0 ] && echo off || echo on)"
+    printf '3-finger drag     : %s (extension: %s)\n' "$( [ "$(conf_get drag3)" = 0 ] && echo off || echo on)" "$(ext_state || echo ?)"
+    if [ -n "$pid" ] && grep -q mbp115-input "/proc/$pid/maps" 2>/dev/null; then
+        echo "Library           : loaded in gnome-shell"
+    else
+        echo "Library           : NOT loaded (log out and back in; kill switch ~/.config/mbp115/input.disable?)"
+    fi
+    journalctl --user -b -o cat 2>/dev/null | grep '\[mbp115-input\]' | tail -3 | sed 's/^/  /'
+}
+
+case ${1:-status} in
+    status) status ;;
+    pointer)
+        custom_ok || { echo "This GNOME version has no custom acceleration curve (requires GNOME 51+)."; exit 1; }
+        k=${3:-1}
+        case ${2:-} in
+            mac)         f=1.0 ;;
+            mac-slow)    f=0.8 ;;
+            mac-fast)    f=1.25 ;;
+            default)     gsettings reset $TP accel-profile; gsettings reset $TP custom-accel-config; conf_set pointer default
+                         echo "Pointer: GNOME default"; exit 0 ;;
+            *) echo "Usage: $0 pointer mac|mac-slow|mac-fast|default [factor]"; exit 2 ;;
+        esac
+        f=$(python3 -I -c "import sys; print(round(float(sys.argv[1]) * float(sys.argv[2]), 3))" "$f" "$k" 2>/dev/null) \
+            || { echo "Factor must be a number, e.g. 1.1"; exit 2; }
+        gsettings set $TP custom-accel-config "$(curve "$f")" && gsettings set $TP accel-profile custom \
+            && conf_set pointer "$2" && conf_set pointer_factor "$k" \
+            && echo "Pointer: curve ${2} (factor $f) active - takes effect immediately"
+        ;;
+    scroll)
+        python3 -c "import sys; v=float(sys.argv[1]); sys.exit(0 if 0.05 <= v <= 5 else 1)" "${2:-x}" 2>/dev/null \
+            || { echo "Usage: $0 scroll <0.05..5>   (1 = unchanged)"; exit 2; }
+        conf_set scroll "$2"; echo "Touchpad scrolling: factor $2 - takes effect with the next gesture"
+        ;;
+    scroll-accel)
+        case ${2:-} in
+            on)  conf_set scroll_accel 1; echo "Scroll acceleration on (slow = precise, fast = farther)" ;;
+            off) conf_set scroll_accel 0; echo "Scroll acceleration off (constant speed)" ;;
+            *) echo "Usage: $0 scroll-accel on|off"; exit 2 ;;
+        esac
+        ;;
+    drag)
+        case ${2:-} in
+            on)  conf_set drag3 1; ext_enable enable;  echo "3-finger drag on (workspaces/overview: 4 fingers)" ;;
+            off) conf_set drag3 0; ext_enable disable; echo "3-finger drag off (workspaces back to 3 fingers)" ;;
+            *) echo "Usage: $0 drag on|off"; exit 2 ;;
+        esac
+        ;;
+    *) echo "Usage: $0 [status|pointer|scroll|scroll-accel|drag]"; exit 2 ;;
+esac

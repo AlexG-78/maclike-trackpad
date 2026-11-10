@@ -1,0 +1,5 @@
+# MacBookPro11,5: load the touchpad refinements into gnome-shell only (3-finger drag, scroll factor).
+# Applies to all instances (org.gnome.Shell@wayland, @ubuntu). To revert: delete this file, log out.
+# Kill switch without root: touch ~/.config/mbp115/input.disable
+[Service]
+Environment=LD_PRELOAD=/usr/local/lib/mbp115/mbp115-input.so
